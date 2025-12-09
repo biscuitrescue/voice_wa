@@ -1,12 +1,13 @@
 import { ParsedMessage, MessageType, VoiceNoteMetadata } from "./types";
+import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { MODEL_NAME, SYSTEM_INSTRUCTION } from "../constants";
+import { decodeAudio } from "../utils/audioUtils";
 
 export class VoiceProcessor {
   private apiKey: string;
-  private transcriptionEndpoint: string =
-    "https://api.openai.com/v1/audio/transcriptions";
 
   constructor(apiKey?: string) {
-    this.apiKey = apiKey || process.env.OPENAI_API_KEY || "";
+    this.apiKey = apiKey || process.env.API_KEY || "";
   }
 
   public async processVoiceMessage(
@@ -29,18 +30,16 @@ export class VoiceProcessor {
     const startTime = Date.now();
 
     try {
-      const transcription = await this.transcribeAudio(
+      const result = await this.transcribeAudio(
         audioBuffer,
-        message.metadata?.mimeType,
+        message.metadata?.mimeType || "audio/ogg",
       );
 
-      const processingTime = Date.now() - startTime;
-
       return {
-        transcription: transcription.text,
-        language: transcription.language,
-        duration: transcription.duration,
-        confidence: transcription.confidence,
+        transcription: result.transcription,
+        language: result.language,
+        duration: this.estimateDurationFromSize(audioBuffer.length),
+        confidence: 0.95,
       };
     } catch (error) {
       console.error("Error processing voice message:", error);
@@ -52,65 +51,236 @@ export class VoiceProcessor {
 
   private async transcribeAudio(
     audioBuffer: Buffer,
-    mimeType?: string,
-  ): Promise<{
-    text: string;
-    language?: string;
-    duration?: number;
-    confidence?: number;
-  }> {
-    return this.mockTranscription(audioBuffer, mimeType);
-  }
+    mimeType: string,
+  ): Promise<{ transcription: string; language?: string }> {
+    if (!this.apiKey) {
+      throw new Error("API key is required");
+    }
 
-  private async mockTranscription(
-    audioBuffer: Buffer,
-    mimeType?: string,
-  ): Promise<{
-    text: string;
-    language?: string;
-    duration?: number;
-    confidence?: number;
-  }> {
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const ai = new GoogleGenAI({ apiKey: this.apiKey });
+    let transcription = "";
+    let detectedLanguage = "";
 
-    return {
-      text: "This is a mock transcription of the voice message. Replace this with actual transcription service.",
-      language: "en",
-      duration: 5.2,
-      confidence: 0.95,
-    };
-  }
+    return new Promise(async (resolve, reject) => {
+      try {
+        const session = await ai.live.connect({
+          model: MODEL_NAME,
+          callbacks: {
+            onopen: async () => {
+              const base64Audio = audioBuffer.toString("base64");
+              session.sendRealtimeInput({
+                media: {
+                  data: base64Audio,
+                  mimeType: mimeType,
+                },
+              });
+            },
+            onmessage: async (message: LiveServerMessage) => {
+              if (message.serverContent?.modelTurn?.parts) {
+                for (const part of message.serverContent.modelTurn.parts) {
+                  if (part.text) {
+                    transcription += part.text;
+                  }
+                }
+              }
 
-  public async transcribeWithWebSpeechAPI(audioBlob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-      if (
-        !("webkitSpeechRecognition" in window) &&
-        !("SpeechRecognition" in window)
-      ) {
-        reject(new Error("Speech recognition not supported in this browser"));
-        return;
+              if (message.serverContent?.turnComplete) {
+                if (transcription) {
+                  detectedLanguage = this.detectLanguage(transcription);
+                }
+
+                session.close?.();
+
+                resolve({
+                  transcription: transcription.trim(),
+                  language: detectedLanguage,
+                });
+              }
+            },
+            onerror: (error) => {
+              console.error("Gemini transcription error:", error);
+              session.close?.();
+              reject(error);
+            },
+            onclose: () => {
+              if (!transcription) {
+                reject(new Error("No transcription received"));
+              }
+            },
+          },
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
+            },
+            systemInstruction: {
+              parts: [{ text: SYSTEM_INSTRUCTION }],
+            },
+          },
+        });
+      } catch (error) {
+        reject(error);
       }
-
-      const SpeechRecognition =
-        (window as any).SpeechRecognition ||
-        (window as any).webkitSpeechRecognition;
-      const recognition = new SpeechRecognition();
-
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.maxAlternatives = 1;
-
-      recognition.onresult = (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        resolve(transcript);
-      };
-
-      recognition.onerror = (event: any) => {
-        reject(new Error(`Speech recognition error: ${event.error}`));
-      };
-
-      recognition.start();
     });
+  }
+
+  public async transcribeAndRespond(
+    audioBuffer: Buffer,
+    mimeType: string = "audio/ogg",
+  ): Promise<{
+    transcription: string;
+    responseAudio: Buffer;
+    language?: string;
+  }> {
+    if (!this.apiKey) {
+      throw new Error("API key is required");
+    }
+
+    const ai = new GoogleGenAI({ apiKey: this.apiKey });
+    let transcription = "";
+    let responseAudioChunks: Uint8Array[] = [];
+    let detectedLanguage = "";
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        const session = await ai.live.connect({
+          model: MODEL_NAME,
+          callbacks: {
+            onopen: async () => {
+              const base64Audio = audioBuffer.toString("base64");
+              session.sendRealtimeInput({
+                media: {
+                  data: base64Audio,
+                  mimeType: mimeType,
+                },
+              });
+            },
+            onmessage: async (message: LiveServerMessage) => {
+              if (message.serverContent?.modelTurn?.parts) {
+                for (const part of message.serverContent.modelTurn.parts) {
+                  if (part.text) {
+                    transcription += part.text;
+                  }
+                  if (part.inlineData?.data) {
+                    const audioData = decodeAudio(part.inlineData.data);
+                    responseAudioChunks.push(audioData);
+                  }
+                }
+              }
+
+              if (message.serverContent?.turnComplete) {
+                if (transcription) {
+                  detectedLanguage = this.detectLanguage(transcription);
+                }
+
+                const combinedAudio =
+                  this.combineAudioChunks(responseAudioChunks);
+
+                session.close?.();
+
+                resolve({
+                  transcription: transcription.trim(),
+                  responseAudio: Buffer.from(combinedAudio),
+                  language: detectedLanguage,
+                });
+              }
+            },
+            onerror: (error) => {
+              console.error("Gemini Live error:", error);
+              session.close?.();
+              reject(error);
+            },
+            onclose: () => {
+              if (!transcription && responseAudioChunks.length === 0) {
+                reject(new Error("Session closed without response"));
+              }
+            },
+          },
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
+            },
+            systemInstruction: {
+              parts: [{ text: SYSTEM_INSTRUCTION }],
+            },
+          },
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  public async generateAudioResponse(
+    text: string,
+    language?: string,
+  ): Promise<Buffer> {
+    if (!this.apiKey) {
+      throw new Error("API key is required");
+    }
+
+    const ai = new GoogleGenAI({ apiKey: this.apiKey });
+    let responseAudioChunks: Uint8Array[] = [];
+
+    return new Promise(async (resolve, reject) => {
+      try {
+        const session = await ai.live.connect({
+          model: MODEL_NAME,
+          callbacks: {
+            onopen: () => {
+              session.sendRealtimeInput({ text: text });
+            },
+            onmessage: async (message: LiveServerMessage) => {
+              const audioData =
+                message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+              if (audioData) {
+                responseAudioChunks.push(decodeAudio(audioData));
+              }
+
+              if (message.serverContent?.turnComplete) {
+                const combinedAudio =
+                  this.combineAudioChunks(responseAudioChunks);
+                session.close?.();
+                resolve(Buffer.from(combinedAudio));
+              }
+            },
+            onerror: (error) => {
+              console.error("Audio generation error:", error);
+              session.close?.();
+              reject(error);
+            },
+            onclose: () => {
+              if (responseAudioChunks.length === 0) {
+                reject(new Error("No audio generated"));
+              }
+            },
+          },
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
+            },
+            systemInstruction: {
+              parts: [{ text: SYSTEM_INSTRUCTION }],
+            },
+          },
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  private combineAudioChunks(chunks: Uint8Array[]): Uint8Array {
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const combined = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return combined;
   }
 
   public extractAudioMetadata(audioBuffer: Buffer): VoiceNoteMetadata {
@@ -136,28 +306,16 @@ export class VoiceProcessor {
     );
   }
 
-  public async convertAudioFormat(
-    audioBuffer: Buffer,
-    fromFormat: string,
-    toFormat: string,
-  ): Promise<Buffer> {
-    console.warn("Audio conversion not implemented, returning original buffer");
-    return audioBuffer;
-  }
-
   public validateAudioBuffer(buffer: Buffer): boolean {
     if (!buffer || buffer.length === 0) {
       return false;
     }
-
     if (buffer.length < 1024) {
       return false;
     }
-
     if (buffer.length > 16 * 1024 * 1024) {
       return false;
     }
-
     return true;
   }
 
@@ -177,15 +335,18 @@ export class VoiceProcessor {
     if (/[\u0900-\u097F]/.test(text)) {
       return "hi";
     }
-
     if (/[\u0B00-\u0B7F]/.test(text)) {
       return "or";
     }
-
     if (/[\u0980-\u09FF]/.test(text)) {
       return "bn";
     }
-
+    if (/[\u0C00-\u0C7F]/.test(text)) {
+      return "te";
+    }
+    if (/[\u0B80-\u0BFF]/.test(text)) {
+      return "ta";
+    }
     return "en";
   }
 
