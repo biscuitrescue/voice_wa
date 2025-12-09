@@ -1,0 +1,7 @@
+{
+  "name": "Kisan Sathi - Oilseeds Advisor",
+  "description": "A multilingual voice agent (English, Hindi, Odia) for farmers to ask questions about oilseeds using Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
